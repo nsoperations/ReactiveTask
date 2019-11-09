@@ -13,29 +13,40 @@ import Result
 /// Describes how to execute a shell command.
 public struct Task {
 	/// The path to the executable that should be launched.
-	public var launchPath: String
+	public let launchPath: String
 
 	/// Any arguments to provide to the executable.
-	public var arguments: [String]
+	public let arguments: [String]
 
 	/// The path to the working directory in which the process should be
 	/// launched.
 	///
 	/// If nil, the launched task will inherit the working directory of its
 	/// parent.
-	public var workingDirectoryPath: String?
+	public let workingDirectoryPath: String?
 
 	/// Environment variables to set for the launched process.
 	///
 	/// If nil, the launched task will inherit the environment of its parent.
-	public var environment: [String: String]?
+	public let environment: [String: String]?
 
-	public init(_ launchPath: String, arguments: [String] = [], workingDirectoryPath: String? = nil, environment: [String: String]? = nil) {
+	public let useCache: Bool
+
+	public init(_ launchPath: String, arguments: [String] = [], workingDirectoryPath: String? = nil, environment: [String: String]? = nil, useCache: Bool = false) {
 		self.launchPath = launchPath
 		self.arguments = arguments
 		self.workingDirectoryPath = workingDirectoryPath
 		self.environment = environment
+		self.useCache = useCache
+		self.identifier = Task.counter.modify { c in
+			c += 1
+			return c
+		}
 	}
+
+	private static let counter = Atomic(0)
+
+	fileprivate let identifier: Int
 
 	/// A GCD group which to wait completion
 	fileprivate static let group = DispatchGroup()
@@ -55,7 +66,7 @@ extension String {
 			in: self,
 			range: NSRange(startIndex..., in: self),
 			withTemplate: "\\\\$0"
-		).replacingOccurrences(of: "\0", with: "␀")
+			).replacingOccurrences(of: "\0", with: "␀")
 	}
 }
 
@@ -383,6 +394,12 @@ extension Signal where Value: TaskEventType {
 }
 
 extension Task {
+
+	private static let taskCache = Atomic(Dictionary<Task, Data>())
+	private static let taskHistory = Atomic(Set<Task>())
+
+	public static var debugLoggingEnabled = false
+
 	/// Launches a new shell task.
 	///
 	/// - Parameters:
@@ -396,7 +413,23 @@ extension Task {
 	public func launch( // swiftlint:disable:this function_body_length cyclomatic_complexity
 		standardInput: SignalProducer<Data, NoError>? = nil,
 		shouldBeTerminatedOnParentExit: Bool = false
-	) -> SignalProducer<TaskEvent<Data>, TaskError> {
+		) -> SignalProducer<TaskEvent<Data>, TaskError> {
+
+		if self.useCache, let cachedData = Task.taskCache.withValue({ $0[self] }) {
+			if Task.debugLoggingEnabled {
+				print("Task #\(self.identifier) cache hit: \(self)")
+			}
+			return SignalProducer<TaskEvent<Data>, TaskError>(values: .launch(self), .standardOutput(cachedData), .success(cachedData))
+		}
+
+		if Task.debugLoggingEnabled {
+			if !Task.taskHistory.modify({ return $0.insert(self) }).inserted {
+				print("Task #\(self.identifier) has been executed before, consider caching")
+			}
+		}
+
+		var launchDate: Date!
+
 		return SignalProducer { observer, lifetime in
 			let queue = DispatchQueue(label: self.description, attributes: [])
 			let group = Task.group
@@ -434,6 +467,9 @@ extension Task {
 					})
 
 				case let .failure(error):
+					if Task.debugLoggingEnabled {
+						print("Task #\(self.identifier) failed: \(error)")
+					}
 					observer.send(error: error)
 					return
 				}
@@ -498,14 +534,29 @@ extension Task {
 						group.enter()
 						process.terminationHandler = { process in
 							let terminationStatus = process.terminationStatus
+							let duration = Date().timeIntervalSince(launchDate)
 							if terminationStatus == EXIT_SUCCESS {
 								// Wait for stderr to finish, then pass
 								// through stdout.
+
+								if Task.debugLoggingEnabled {
+									print(String(format: "Task #\(self.identifier) finished successfully in %.2f s.", duration))
+								}
+
 								lifetime += stderrAggregated
 									.then(stdoutAggregated)
-									.map(TaskEvent.success)
+									.map { data in
+										if self.useCache {
+											Task.taskCache.modify { $0[self] = data }
+										}
+										return TaskEvent.success(data)
+									}
 									.start(observer)
 							} else {
+
+								if Task.debugLoggingEnabled {
+									print(String(format: "Task #\(self.identifier) failed with exit code \(terminationStatus) in %.2f s.", duration))
+								}
 								// Wait for stdout to finish, then pass
 								// through stderr.
 								lifetime += stdoutAggregated
@@ -519,6 +570,11 @@ extension Task {
 							group.leave()
 						}
 
+						launchDate = Date()
+						if Task.debugLoggingEnabled {
+							print("Task #\(self.identifier) launched: \(self)")
+						}
+
 						observer.send(value: .launch(self))
 
 						if #available(macOS 10.13, *) {
@@ -529,6 +585,9 @@ extension Task {
 								}
 								try process.run()
 							} catch {
+								if Task.debugLoggingEnabled {
+									print("Task #\(self.identifier) launch failed: \(error.localizedDescription)")
+								}
 								observer.send(error: TaskError.launchFailed(self, reason: error.localizedDescription))
 								return
 							}
@@ -548,7 +607,7 @@ extension Task {
 				.startWithSignal { signal, taskDisposable in
 					lifetime += taskDisposable
 					signal.observe(observer)
-				}
+			}
 		}
 	}
 }

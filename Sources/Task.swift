@@ -31,7 +31,7 @@ public struct Task {
 	///
 	/// If nil, the launched task will inherit the environment of its parent.
 	public var environment: [String: String]?
-
+    
     public let identifier = Task.globalIdentifier.modify({ value -> Int in
         value += 1
         return value
@@ -536,7 +536,7 @@ extension Task {
 							group.leave()
 						}
 
-                        observer.send(value: .launch(self))
+						observer.send(value: .launch(self))
 
 						if #available(macOS 10.13, *) {
 							do {
@@ -567,10 +567,8 @@ extension Task {
 					signal.observe(observer)
 				}
 		}
-        .on(failed: { taskError in
-            Task.globalPipe.input.send(error: taskError)
-        }, value: { taskEvent in
-            Task.globalPipe.input.send(value: taskEvent)
+        .on(event: { event in
+            Task.globalPipe.input.send(event)
         })
     }
 }
